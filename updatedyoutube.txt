@@ -1,0 +1,428 @@
+"""
+YouTube Scraper — AI News Aggregator
+-------------------------------------
+Pulls recent videos + transcripts from one or more YouTube channels via RSS,
+generates a short AI summary + key insights for each video (so you can decide
+whether it's worth watching without watching it), and can email you the
+digest directly.
+
+Requires: pip install feedparser pydantic youtube-transcript-api anthropic
+
+Environment variables:
+  ANTHROPIC_API_KEY   - required for summarization
+  PROXY_USERNAME / PROXY_PASSWORD - optional, for Webshare proxy (transcript fetching)
+  SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASSWORD / EMAIL_TO - optional, for emailing the digest.
+    If any of these are missing, the digest is just written to digest.md instead of emailed.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import smtplib
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import List, Optional
+
+import feedparser
+from anthropic import Anthropic
+from pydantic import BaseModel
+from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api._errors import NoTranscriptFound, TranscriptsDisabled
+from youtube_transcript_api.proxies import WebshareProxyConfig
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("youtube_scraper")
+
+RSS_ENTRY_CAP = 15  # YouTube's channel RSS feed only ever returns ~15 items
+SEEN_VIDEOS_FILE = Path(__file__).parent / "seen_videos.json"
+SUMMARY_MODEL = "claude-haiku-4-5-20251001"  # fast + cheap, good enough for digests
+
+IMPORTANCE_KEYWORDS = [
+    "release", "released", "launch", "launches", "launching",
+    "announc", "new model", "update", "breaking", "just dropped",
+    "unveil", "ships", "shipping", "available now", "beta", "preview",
+]
+
+
+class Transcript(BaseModel):
+    text: str
+
+
+class ChannelVideo(BaseModel):
+    title: str
+    url: str
+    video_id: str
+    channel_id: str
+    channel_name: str
+    published_at: datetime
+    description: str
+    transcript: Optional[str] = None
+    tldr: Optional[str] = None
+    key_insights: Optional[List[str]] = None
+
+    @property
+    def is_likely_important(self) -> bool:
+        haystack = f"{self.title} {self.description[:300]}".lower()
+        return any(kw in haystack for kw in IMPORTANCE_KEYWORDS)
+
+
+class YouTubeScraper:
+    def __init__(self, seen_videos_path: Path = SEEN_VIDEOS_FILE):
+        proxy_config = None
+        proxy_username = os.getenv("PROXY_USERNAME")
+        proxy_password = os.getenv("PROXY_PASSWORD")
+
+        if proxy_username and proxy_password:
+            proxy_config = WebshareProxyConfig(
+                proxy_username=proxy_username,
+                proxy_password=proxy_password,
+            )
+
+        self.transcript_api = YouTubeTranscriptApi(proxy_config=proxy_config)
+        self.seen_videos_path = seen_videos_path
+        self._seen_ids = self._load_seen_ids()
+
+    # ---------- persistence / dedup ----------
+
+    def _load_seen_ids(self) -> set:
+        if self.seen_videos_path.exists():
+            try:
+                return set(json.loads(self.seen_videos_path.read_text()))
+            except (json.JSONDecodeError, OSError):
+                log.warning("Could not read seen_videos.json, starting fresh")
+        return set()
+
+    def _save_seen_ids(self) -> None:
+        try:
+            self.seen_videos_path.write_text(json.dumps(sorted(self._seen_ids)))
+        except OSError as e:
+            log.warning(f"Could not persist seen_videos.json: {e}")
+
+    # ---------- helpers ----------
+
+    def _get_rss_url(self, channel_id: str) -> str:
+        return f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+
+    def _extract_video_id(self, video_url: str) -> str:
+        if "youtube.com/watch?v=" in video_url:
+            return video_url.split("v=")[1].split("&")[0]
+        if "youtube.com/shorts/" in video_url:
+            return video_url.split("shorts/")[1].split("?")[0]
+        if "youtu.be/" in video_url:
+            return video_url.split("youtu.be/")[1].split("?")[0]
+        return video_url
+
+    # ---------- core fetch methods ----------
+
+    def get_transcript(self, video_id: str, retries: int = 2) -> Optional[Transcript]:
+        last_error = None
+        for attempt in range(retries + 1):
+            try:
+                transcript = self.transcript_api.fetch(video_id)
+                text = " ".join(snippet.text for snippet in transcript.snippets)
+                return Transcript(text=text)
+            except (TranscriptsDisabled, NoTranscriptFound):
+                return None  # no point retrying — transcript genuinely doesn't exist
+            except Exception as e:
+                last_error = e
+                if attempt < retries:
+                    log.warning(f"Transcript fetch failed for {video_id} (attempt {attempt + 1}), retrying...")
+        log.error(f"Transcript fetch failed for {video_id} after {retries + 1} attempts: {last_error}")
+        return None
+
+    def get_latest_videos(self, channel_id: str, hours: int = 24) -> List[ChannelVideo]:
+        feed = feedparser.parse(self._get_rss_url(channel_id))
+
+        if getattr(feed, "bozo", 0):
+            log.warning(f"Feed for channel {channel_id} may be malformed: {feed.bozo_exception}")
+
+        if not feed.entries:
+            log.info(f"No entries found for channel {channel_id}")
+            return []
+
+        if len(feed.entries) >= RSS_ENTRY_CAP:
+            log.warning(
+                f"Channel {channel_id} returned {len(feed.entries)} entries "
+                f"(the RSS cap). If this channel posts frequently, some older "
+                f"videos in your time window may be missing — consider the "
+                f"YouTube Data API for this channel instead."
+            )
+
+        channel_name = feed.feed.get("title", channel_id)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=hours)
+        videos = []
+
+        for entry in feed.entries:
+            if "/shorts/" in entry.link:
+                continue
+            published_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
+            if published_time >= cutoff_time:
+                video_id = self._extract_video_id(entry.link)
+                videos.append(
+                    ChannelVideo(
+                        title=entry.title,
+                        url=entry.link,
+                        video_id=video_id,
+                        channel_id=channel_id,
+                        channel_name=channel_name,
+                        published_at=published_time,
+                        description=entry.get("summary", ""),
+                    )
+                )
+
+        return videos
+
+    def scrape_channel(
+        self, channel_id: str, hours: int = 150, skip_seen: bool = True
+    ) -> List[ChannelVideo]:
+        videos = self.get_latest_videos(channel_id, hours)
+
+        if skip_seen:
+            new_videos = [v for v in videos if v.video_id not in self._seen_ids]
+            skipped = len(videos) - len(new_videos)
+            if skipped:
+                log.info(f"Skipping {skipped} already-seen video(s) for {channel_id}")
+            videos = new_videos
+
+        if not videos:
+            return []
+
+        log.info(f"Fetching {len(videos)} transcript(s) for channel {channel_id}...")
+        result = []
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_video = {
+                executor.submit(self.get_transcript, v.video_id): v for v in videos
+            }
+            for future in as_completed(future_to_video):
+                video = future_to_video[future]
+                transcript = future.result()
+                result.append(video.model_copy(update={"transcript": transcript.text if transcript else None}))
+                self._seen_ids.add(video.video_id)
+
+        self._save_seen_ids()
+        result.sort(key=lambda v: v.published_at, reverse=True)
+        return result
+
+    def scrape_channels(
+        self, channel_ids: List[str], hours: int = 150, skip_seen: bool = True
+    ) -> List[ChannelVideo]:
+        """Scrape multiple channels concurrently and return combined, sorted results."""
+        all_videos: List[ChannelVideo] = []
+        with ThreadPoolExecutor(max_workers=min(5, len(channel_ids) or 1)) as executor:
+            futures = [
+                executor.submit(self.scrape_channel, cid, hours, skip_seen)
+                for cid in channel_ids
+            ]
+            for future in as_completed(futures):
+                all_videos.extend(future.result())
+
+        all_videos.sort(key=lambda v: v.published_at, reverse=True)
+        return all_videos
+
+
+# ---------- AI summarization ----------
+
+class Summarizer:
+    """Turns a raw transcript into a short TL;DR + key insight bullets,
+    so you can decide whether a video is worth watching without watching it."""
+
+    SYSTEM_PROMPT = (
+        "You summarize YouTube video transcripts for a busy tech/AI reader who "
+        "wants to decide whether to watch the full video. Respond ONLY with "
+        "valid JSON, no markdown fences, no preamble, in this exact shape:\n"
+        '{"tldr": "one sentence, max ~25 words", '
+        '"key_insights": ["insight 1", "insight 2", "insight 3"]}\n'
+        "key_insights should be 3-5 short bullets capturing the concrete, "
+        "specific takeaways (names, numbers, tools, decisions) — not vague "
+        "generalities. If the video announces something new (a tool, model, "
+        "release, technique), that must be the first insight."
+    )
+
+    def __init__(self, model: str = SUMMARY_MODEL):
+        self.client = Anthropic()  # reads ANTHROPIC_API_KEY from env
+        self.model = model
+
+    def summarize(self, video: ChannelVideo) -> ChannelVideo:
+        if not video.transcript:
+            return video
+
+        # Transcripts can be long; trim to keep cost/latency down while keeping
+        # enough context for a good summary.
+        transcript_excerpt = video.transcript[:12000]
+
+        try:
+            response = self.client.messages.create(
+                model=self.model,
+                max_tokens=500,
+                system=self.SYSTEM_PROMPT,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Title: {video.title}\n\nTranscript:\n{transcript_excerpt}",
+                    }
+                ],
+            )
+            raw_text = response.content[0].text.strip()
+            raw_text = raw_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            parsed = json.loads(raw_text)
+            return video.model_copy(
+                update={
+                    "tldr": parsed.get("tldr"),
+                    "key_insights": parsed.get("key_insights"),
+                }
+            )
+        except Exception as e:
+            log.error(f"Summarization failed for {video.video_id}: {e}")
+            return video
+
+    def summarize_all(self, videos: List[ChannelVideo], max_workers: int = 4) -> List[ChannelVideo]:
+        with_transcript = [v for v in videos if v.transcript]
+        without_transcript = [v for v in videos if not v.transcript]
+
+        if not with_transcript:
+            return videos
+
+        log.info(f"Summarizing {len(with_transcript)} video(s)...")
+        results = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for video in executor.map(self.summarize, with_transcript):
+                results.append(video)
+
+        results.extend(without_transcript)
+        results.sort(key=lambda v: v.published_at, reverse=True)
+        return results
+
+
+# ---------- output formatting ----------
+
+def build_digest_markdown(videos: List[ChannelVideo]) -> str:
+    if not videos:
+        return "No new videos found in this time window.\n"
+
+    important = [v for v in videos if v.is_likely_important]
+    lines = [f"# YouTube Digest — {datetime.now().strftime('%Y-%m-%d')}\n"]
+
+    if important:
+        lines.append(f"## 🔥 {len(important)} video(s) look like major updates\n")
+        for v in important:
+            lines.append(f"- **{v.title}** — {v.channel_name}")
+        lines.append("")
+
+    lines.append(f"## 📺 All {len(videos)} video(s)\n")
+    for v in videos:
+        flag = "⭐ " if v.is_likely_important else ""
+        lines.append(f"### {flag}{v.title}")
+        lines.append(f"- **Channel:** {v.channel_name}")
+        lines.append(f"- **Published:** {v.published_at.strftime('%Y-%m-%d %H:%M UTC')}")
+        lines.append(f"- **URL:** {v.url}")
+        if v.tldr:
+            lines.append(f"- **TL;DR:** {v.tldr}")
+        if v.key_insights:
+            lines.append("- **Key insights:**")
+            for insight in v.key_insights:
+                lines.append(f"  - {insight}")
+        if not v.transcript:
+            lines.append("- *(no transcript available — couldn't summarize)*")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def print_video_summary(videos: List[ChannelVideo]) -> None:
+    if not videos:
+        print("No new videos found in this time window.")
+        return
+
+    important = [v for v in videos if v.is_likely_important]
+    if important:
+        print(f"\n🔥 {len(important)} video(s) look like major updates:\n")
+        for v in important:
+            print(f"  ⭐ {v.title}  [{v.channel_name}]")
+        print()
+
+    print(f"📺 {len(videos)} video(s) total:\n")
+    for v in videos:
+        flag = "⭐ " if v.is_likely_important else ""
+        print(f"- {flag}{v.title}")
+        print(f"    • Channel:     {v.channel_name}")
+        print(f"    • Published:   {v.published_at.strftime('%Y-%m-%d %H:%M UTC')}")
+        print(f"    • URL:         {v.url}")
+        if v.tldr:
+            print(f"    • TL;DR:       {v.tldr}")
+        if v.key_insights:
+            print("    • Key insights:")
+            for insight in v.key_insights:
+                print(f"        - {insight}")
+        if not v.transcript:
+            print("    • (no transcript available — couldn't summarize)")
+        print()
+
+
+# ---------- optional email delivery ----------
+
+def send_email_digest(videos: List[ChannelVideo]) -> bool:
+    """Emails the digest if SMTP env vars are set. Returns True if sent."""
+    smtp_host = os.getenv("SMTP_HOST")
+    smtp_port = os.getenv("SMTP_PORT")
+    smtp_user = os.getenv("SMTP_USER")
+    smtp_password = os.getenv("SMTP_PASSWORD")
+    email_to = os.getenv("EMAIL_TO")
+
+    if not all([smtp_host, smtp_port, smtp_user, smtp_password, email_to]):
+        log.info("SMTP env vars not fully set — skipping email, writing digest.md instead")
+        return False
+
+    body = build_digest_markdown(videos)
+    msg = MIMEMultipart()
+    msg["From"] = smtp_user
+    msg["To"] = email_to
+    msg["Subject"] = f"YouTube Digest — {len(videos)} new video(s) — {datetime.now().strftime('%Y-%m-%d')}"
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
+            server.starttls()
+            server.login(smtp_user, smtp_password)
+            server.send_message(msg)
+        log.info(f"Digest emailed to {email_to}")
+        return True
+    except Exception as e:
+        log.error(f"Failed to send email digest: {e}")
+        return False
+
+
+if __name__ == "__main__":
+    # Add as many channel IDs here as you want to track — e.g. AI/tech creators.
+    CHANNELS_TO_TRACK = [
+        "UCn8ujwUInbJkBhffxqAPBVQ",  # Dave Ebbelaar / Datalumina
+        # "UCXUPKJO5MZQN11PqgIvyuvQ",  # example: add more channel IDs here
+    ]
+
+    scraper = YouTubeScraper()
+    videos = scraper.scrape_channels(CHANNELS_TO_TRACK, hours=200)
+
+    if os.getenv("ANTHROPIC_API_KEY"):
+        summarizer = Summarizer()
+        videos = summarizer.summarize_all(videos)
+    else:
+        log.warning("ANTHROPIC_API_KEY not set — skipping AI summaries, showing raw transcripts only")
+
+    print_video_summary(videos)
+
+    output_path = Path(__file__).parent / "latest_videos.json"
+    output_path.write_text(json.dumps([v.model_dump(mode="json") for v in videos], indent=2))
+    log.info(f"Wrote {len(videos)} video record(s) to {output_path}")
+
+    if not send_email_digest(videos):
+        digest_path = Path(__file__).parent / "digest.md"
+        digest_path.write_text(build_digest_markdown(videos))
+        log.info(f"Digest saved to {digest_path} (set SMTP_* env vars to email it instead)")
