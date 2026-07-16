@@ -64,7 +64,11 @@ flowchart TD
 ### 1. Clone and install dependencies
 
 ```bash
+<<<<<<< HEAD
 git clone <https://github.com/aaquibmomin2003/AI_NEWS_AGGREGATOR>
+=======
+git clone https://github.com/aaquibmomin2003/AI_NEWS_AGGREGATOR
+>>>>>>> c7d44c0e3714fbbcb9ccee000e6fee2ff2e2a7ee
 cd ai-news-aggregator
 uv sync
 ```
