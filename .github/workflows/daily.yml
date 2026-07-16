@@ -2,8 +2,12 @@ name: Daily AI News Digest
 
 on:
   schedule:
+    # Runs at 08:00 UTC every day. GitHub Actions cron times are UTC and
+    # can be delayed by a few minutes (occasionally more) during high load
+    # on GitHub's infrastructure — this is a known platform limitation,
+    # not something you can tune away.
     - cron: "0 8 * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {}  # lets you trigger it manually from the Actions tab, for testing
 
 jobs:
   run-pipeline:
@@ -37,9 +41,6 @@ jobs:
           POSTGRES_PASSWORD: ${{ secrets.POSTGRES_PASSWORD }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          SMTP_HOST: ${{ secrets.SMTP_HOST }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
-          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          MY_EMAIL: ${{ secrets.MY_EMAIL }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
         run: uv run python -m app.daily_runner
