@@ -1,0 +1,3 @@
+[33m4efbc7e[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m Add root conftest.py to fix ModuleNotFoundError in CI
+[33m69cba46[m Merge remote changes
+[33mc438d2c[m Move Gmail smoke-test out of pytest suite; fix MagicMock typo
