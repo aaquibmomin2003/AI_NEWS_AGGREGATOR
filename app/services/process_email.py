@@ -17,6 +17,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class NoDigestsAvailable(Exception):
+    """Raised when there's genuinely nothing new to email. This is an
+    expected, normal outcome on a quiet news day — not a pipeline failure —
+    so it's kept as its own exception type rather than a generic ValueError,
+    to make that distinction explicit and impossible to miss downstream."""
+    pass
+
+
 def generate_email_digest(hours: int = 24, top_n: int = 10) -> EmailDigestResponse:
     curator = CuratorAgent(USER_PROFILE)
     email_agent = EmailAgent(USER_PROFILE)
@@ -27,7 +35,7 @@ def generate_email_digest(hours: int = 24, top_n: int = 10) -> EmailDigestRespon
     
     if total == 0:
         logger.warning(f"No digests found from the last {hours} hours")
-        raise ValueError("No digests available")
+        raise NoDigestsAvailable("No digests available")
     
     logger.info(f"Ranking {total} digests for email generation")
     ranked_articles = curator.rank_digests(digests)
@@ -86,6 +94,17 @@ def send_digest_email(hours: int = 24, top_n: int = 10) -> dict:
             "subject": subject,
             "articles_count": len(result.articles)
         }
+    except NoDigestsAvailable:
+        # Not a failure — just nothing new to report today. Distinguished
+        # from real errors so CI doesn't show a false red ❌ and you don't
+        # get a "workflow failed" email for a perfectly normal quiet day.
+        logger.info("No new content to email today — this is expected, not an error.")
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "no digests available in the requested window",
+            "articles_count": 0
+        }
     except ValueError as e:
         logger.error(f"Error sending email: {e}")
         return {
@@ -97,8 +116,11 @@ def send_digest_email(hours: int = 24, top_n: int = 10) -> dict:
 if __name__ == "__main__":
     result = send_digest_email(hours=24, top_n=10)
     if result["success"]:
-        print("\n=== Email Digest Sent ===")
-        print(f"Subject: {result['subject']}")
-        print(f"Articles: {result['articles_count']}")
+        if result.get("skipped"):
+            print("\n=== No Email Sent (nothing new today) ===")
+        else:
+            print("\n=== Email Digest Sent ===")
+            print(f"Subject: {result['subject']}")
+            print(f"Articles: {result['articles_count']}")
     else:
         print(f"Error: {result['error']}")
