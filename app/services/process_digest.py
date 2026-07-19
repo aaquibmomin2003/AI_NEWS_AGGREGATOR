@@ -1,6 +1,7 @@
 from typing import Optional
 import logging
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -15,32 +16,39 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Small pause between each digest-generation call. Groq's free-tier rate
+# limit was getting hit hard once processing more than ~10 articles in a
+# run (repeated 429s, each costing several seconds of retry backoff) —
+# pacing requests proactively is faster and cheaper overall than reacting
+# to 429s after the fact.
+DIGEST_REQUEST_DELAY_SECONDS = 1.0
+
 
 def process_digests(limit: Optional[int] = None) -> dict:
     agent = DigestAgent()
     repo = Repository()
-    
+
     articles = repo.get_articles_without_digest(limit=limit)
     total = len(articles)
     processed = 0
     failed = 0
-    
+
     logger.info(f"Starting digest processing for {total} articles")
-    
+
     for idx, article in enumerate(articles, 1):
         article_type = article["type"]
         article_id = article["id"]
         article_title = article["title"][:60] + "..." if len(article["title"]) > 60 else article["title"]
-        
+
         logger.info(f"[{idx}/{total}] Processing {article_type}: {article_title} (ID: {article_id})")
-        
+
         try:
             digest_result = agent.generate_digest(
                 title=article["title"],
                 content=article["content"],
                 article_type=article_type
             )
-            
+
             if digest_result:
                 repo.create_digest(
                     article_type=article_type,
@@ -58,9 +66,16 @@ def process_digests(limit: Optional[int] = None) -> dict:
         except Exception as e:
             failed += 1
             logger.error(f"✗ Error processing {article_type} {article_id}: {e}")
-    
+
+        # Pace requests to stay under Groq's rate limit, rather than
+        # relying entirely on reactive retry-after-429 behavior. Skip the
+        # sleep after the very last item — no point waiting when there's
+        # nothing left to send.
+        if idx < total:
+            time.sleep(DIGEST_REQUEST_DELAY_SECONDS)
+
     logger.info(f"Processing complete: {processed} processed, {failed} failed out of {total} total")
-    
+
     return {
         "total": total,
         "processed": processed,
